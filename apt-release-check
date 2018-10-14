@@ -1,0 +1,191 @@
+#!/usr/bin/perl
+#
+# Run with --help option for docs.
+#
+# If the 'perl-doc' package is not installed, you can just read the
+# documentation source by scrolling down to __END__
+#
+
+use 5.018;
+use strict;
+use warnings;
+use autodie;
+
+use Pod::Usage      qw(pod2usage);
+use Getopt::Long    qw(GetOptions);
+use Cwd             qw(abs_path);
+
+my %hash_prog = (
+    MD5Sum    => 'md5sum',
+    SHA1      => 'sha1sum',
+    SHA256    => 'sha256sum',
+    SHA512    => 'sha512sum',
+);
+my(%opt);
+
+if(!GetOptions(\%opt,
+    'help|?',
+)) {
+    pod2usage(-exitval => 3,  -verbose => 0);
+}
+
+
+pod2usage(-exitstatus => 0, -verbose => 2) if $opt{help};
+
+pod2usage(-exitval => 3,  -verbose => 0,
+    -message => 'Need a Release file pathname'
+) unless @ARGV;
+
+my %apt_key_map = load_apt_keys();
+
+my @files = map { abs_path($_) } @ARGV;
+my $count = 0;
+while(my $release_file = shift @files) {
+    validate_release($release_file);
+    $count++;
+}
+
+my $s = $count == 1 ? '' : 's';
+print "OK - $count repo$s checked\n";
+
+exit 0;
+
+sub load_apt_keys {
+    my %map;
+    foreach my $keyring ('/etc/apt/trusted.gpg', glob("/etc/apt/trusted.gpg.d/*.gpg")) {
+        next unless -r $keyring;
+        my @info = `gpg --no-default-keyring --keyring $keyring --list-keys 2>&1`;
+        foreach (@info) {
+            if(my($key_id) = $_ =~ m{^pub\s+\w+/(\w+)}) {
+                $map{$key_id} = $keyring;
+            }
+        }
+    }
+
+    return %map;
+}
+
+
+sub fail_check {
+    my($message) = @_;
+
+    print "CRITICAL - $message\n";
+    exit 2;
+}
+
+
+sub validate_release {
+    my($filename) = @_;
+
+    my($dir, $basename) = $filename =~ m{^(.*)/([^/]+)$};
+    die "$filename is not a 'Release' file\n" unless $basename eq 'Release';
+    chdir($dir);
+    validate_release_signature($filename);
+    open my $fh, '<', $filename;
+    my $hash_type = '';
+    while(<$fh>) {
+        if(m{^(\w+):\s*$}) {
+            $hash_type = $1;
+            next;
+        }
+        if(my($hash, $pkg_file) = $_ =~ m{\s+(\w+)\s+\d+\s+(\S+/Packages\S*)}) {
+            if(! -e $pkg_file) {
+                next if $pkg_file =~ m{/Packages$/};
+            }
+            if(not -e $pkg_file) {
+                fail_check("$filename refers to non-existent file: $pkg_file");
+            }
+            validate_file($hash_type, $hash, $pkg_file);
+        }
+    }
+}
+
+
+sub validate_release_signature {
+    my($filename) = @_;
+
+    my $verify_args = "--verify Release.gpg Release";
+    my $info = `gpg $verify_args 2>&1`;
+    if(my($key_id) = $info =~ m{key ID (\w+)}) {
+        if(my $keyring = $apt_key_map{$key_id}) {
+            my $check = `gpg --no-default-keyring --keyring $keyring $verify_args 2>&1`;
+            if($? != 0) {
+                fail_check("bad signature on $filename");
+            }
+            return;
+        }
+    }
+    if(-t 1) {
+        warn "WARNING - can't check signature on $filename\n";
+    }
+}
+
+
+sub validate_file {
+    my($hash_type, $expected_hash, $pkg_file) = @_;
+
+    die "file does not exist: $pkg_file" unless -e $pkg_file;
+    my $hasher = $hash_prog{$hash_type}
+        or die "Unknown hash type: '$hash_type'\n";
+
+    chomp(my $hash = `$hasher $pkg_file`);
+    $hash =~ s{\s+.*\z}{}s;
+    if(lc($hash) ne lc($expected_hash)) {
+        fail_check("bad $hash_type for '$pkg_file'");
+    }
+}
+
+__END__
+
+=head1 NAME
+
+apt-release-check - check apt index signatures (Nagios compatible)
+
+=head1 SYNOPSIS
+
+  apt-release-check [options] <apt-Release-file-names>
+
+  Options:
+
+   -?     detailed help message
+
+=head1 DESCRIPTION
+
+Give this script the pathname of a Debian 'Release' file in the root of an
+apt repository and it will validate checksums of the Packages files.  Give it
+a list of Release filenames and it will check all of them.
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<--help>
+
+Display this documentation.
+
+=back
+
+=head1 NOTES
+
+This program will also attempt to verify the GPG 'release signature' however
+it's ability to check signatures will depend on the permission settings of the
+APT keyring files in F</etc/apt/trust*>.
+
+If the script cannot find a signing key in the readable keyring files, it will
+emit a warning and skip the signature check.  The warning will not be emitted
+unless the script is being run interactively from a terminal (i.e.: when polled
+via nrpe an unreadable key file will not trigger a critical failure).
+
+=head1 COPYRIGHT
+
+Copyright 2018 Catalyst IT.  Original author: Grant McLean
+E<lt>grant@catalyst.net.nzE<gt>
+
+This library is free software; you can redistribute it and/or modify it
+under the same terms as Perl itself.
+
+=cut
+
+
+
+
